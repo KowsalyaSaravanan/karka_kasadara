@@ -1,0 +1,17 @@
+# Virtual environment
+.venv/
+
+# Environment variables (contains API keys)
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# uv lock (optional to commit, keeping it out for simplicity)
+# uv.lock
+
+# OS
+.DS_Store
+Thumbs.db

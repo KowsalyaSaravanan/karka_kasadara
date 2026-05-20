@@ -1,0 +1,6 @@
+[project]
+name = "rag-project"
+version = "0.1.0"
+description = "RAG system with LangGraph agents and FastAPI backend"
+requires-python = ">=3.12"
+dependencies = []

@@ -1,0 +1,444 @@
+================================================================
+VELAMMAL RAG PROJECT - DEEP DIVE NOTES
+What I built, why I chose each thing, how it works, how to debug
+================================================================
+
+
+----------------------------------------------------------------
+WHAT IS RAG? (Retrieval Augmented Generation)
+----------------------------------------------------------------
+
+Normal LLM problem:
+  - You ask Gemini "what is Velammal fee structure?"
+  - Gemini doesn't know. It will either say "I don't know" or hallucinate (make up an answer)
+
+RAG solution:
+  - Before asking the LLM, we SEARCH our own documents first
+  - We find the most relevant paragraphs from our dataset
+  - We give those paragraphs to the LLM as context
+  - LLM answers ONLY from that context
+  - Result: accurate, grounded answers. No hallucination.
+
+Think of it like this:
+  - Without RAG: asking someone a question with no reference material
+  - With RAG: giving them the relevant pages from a book, then asking the question
+
+
+----------------------------------------------------------------
+FULL FLOW - STEP BY STEP
+----------------------------------------------------------------
+
+STEP 1 - INGEST (run once, offline)
+  dataset.txt --> split into chunks --> embed each chunk --> store in FAISS
+
+STEP 2 - QUERY (runs on every API call)
+  user query --> embed query --> search FAISS --> get top 3 chunks --> send to Gemini --> answer
+
+
+----------------------------------------------------------------
+FILE 1: ingest.py
+----------------------------------------------------------------
+
+PURPOSE: Prepare the data. Run this once before starting the API.
+
+WHAT IT DOES:
+  1. Reads dataset.txt
+  2. Splits into chunks
+  3. Converts each chunk to a vector (embedding)
+  4. Stores all vectors in FAISS index
+  5. Saves index to faiss_index.bin and chunks to chunks.json
+
+--- CHUNKING ---
+
+What is chunking?
+  Breaking a big document into smaller pieces.
+  We can't send the whole document to the LLM every time - too many tokens, too slow.
+  We need to find only the RELEVANT parts.
+
+Why paragraph splitting?
+  I first tried splitting every 200 characters. Problem: sentences got cut in the middle.
+  Example: "Fee payments are structured in install" -- cut off, loses meaning.
+  
+  Paragraph splitting (split by "\n\n") keeps each idea together.
+  Each paragraph in this dataset talks about ONE topic:
+    - paragraph 1 = about admissions
+    - paragraph 2 = about fees
+    - paragraph 3 = about transport
+  So paragraph = natural chunk boundary.
+
+Code:
+  raw_chunks = content.split("\n\n")
+  chunks = [c.strip() for c in raw_chunks if c.strip()]
+  
+  .strip() removes extra spaces/newlines
+  "if c.strip()" skips empty lines
+
+--- EMBEDDINGS ---
+
+What is an embedding?
+  Converting text into a list of numbers (a vector).
+  Similar meaning = similar numbers = close together in vector space.
+  
+  Example:
+    "fee payment" --> [0.2, 0.8, 0.1, 0.5, ...]
+    "fee structure" --> [0.21, 0.79, 0.12, 0.48, ...]  (very close)
+    "sports activities" --> [0.9, 0.1, 0.7, 0.2, ...]  (far away)
+
+Model used: all-MiniLM-L6-v2
+  - Free, runs locally, no API needed
+  - 384-dimensional vectors
+  - Fast and accurate enough for this dataset size
+  - Downloaded from HuggingFace automatically on first run
+
+Code:
+  model = SentenceTransformer("all-MiniLM-L6-v2")
+  embeddings = model.encode(chunks, convert_to_numpy=True)
+
+--- FAISS ---
+
+What is FAISS?
+  Facebook AI Similarity Search.
+  A library to store vectors and search them very fast.
+  
+  Think of it like a database, but instead of searching by ID or name,
+  you search by "which stored vector is closest to my query vector?"
+
+Why normalize + IndexFlatIP?
+  faiss.normalize_L2(embeddings)  --> makes all vectors length = 1
+  faiss.IndexFlatIP(dim)          --> Inner Product search
+  
+  When vectors are normalized, Inner Product = Cosine Similarity.
+  Cosine similarity measures the ANGLE between vectors, not the distance.
+  This is better for text because it focuses on meaning, not length of text.
+
+  Without normalization: longer paragraphs would score higher just because they have more words.
+  With normalization: score is purely about semantic similarity.
+
+
+----------------------------------------------------------------
+FILE 2: agent.py
+----------------------------------------------------------------
+
+PURPOSE: The brain. Takes a query, retrieves relevant chunks, generates answer.
+Uses LangGraph to structure the pipeline as a graph.
+
+--- WHY LANGGRAPH? ---
+
+LangGraph is a framework for building AI agents as graphs.
+A graph has NODES (steps) and EDGES (connections between steps).
+
+Our graph:
+  START --> retrieve_node --> generate_node --> END
+
+Why not just write two functions and call them?
+  You could. But LangGraph gives you:
+  - Clear state management (what data flows between steps)
+  - Easy to add more nodes later (reranker, query rewriter, memory)
+  - Visualizable pipeline
+  - Built-in error handling per node
+
+--- STATE ---
+
+class AgentState(TypedDict):
+    query: str       # the user's question
+    chunks: list     # filled by retrieve_node
+    answer: str      # filled by generate_node
+
+This is the "envelope" that gets passed between nodes.
+Each node reads from it and adds to it.
+TypedDict means Python knows the exact shape - helps catch bugs.
+
+--- RETRIEVE NODE ---
+
+def retrieve_node(state):
+  1. Take state["query"]
+  2. Embed it using the same model we used for chunks
+     IMPORTANT: must use same model, otherwise vectors are in different spaces
+  3. Normalize the query vector (same as we did for chunks)
+  4. faiss_index.search(q_vec, TOP_K=3) --> returns scores and indices
+  5. Use indices to look up actual text from all_chunks list
+  6. Return top 3 with rank, score, chunk text
+
+Score meaning:
+  Score = cosine similarity, range 0 to 1
+  1.0 = identical meaning
+  0.8+ = very relevant
+  0.5-0.7 = somewhat relevant
+  below 0.3 = probably not relevant
+
+--- GENERATE NODE ---
+
+def generate_node(state):
+  1. Join the 3 chunks into one context string
+  2. Build a strict prompt:
+     - "Answer ONLY from context below"
+     - "Do NOT use outside knowledge"
+     - "If not in context, say I don't know"
+  3. Send to Gemini via LangChain
+  4. Return the answer
+
+Why this prompt structure?
+  Without strict instructions, LLMs use their training data.
+  Example: ask "what is Velammal fee?" without strict prompt
+  --> Gemini might say "school fees in India are typically 50,000-1,00,000 per year"
+  --> That's hallucination. We don't want that.
+  
+  With strict prompt --> Gemini only uses what we gave it.
+
+Why temperature=0.2?
+  Temperature controls randomness.
+  0.0 = always picks the most likely word (very deterministic)
+  1.0 = more creative, more random
+  0.2 = mostly deterministic but slight variation
+  
+  For factual Q&A we want low temperature. We don't want creative answers.
+
+--- WHY gemini-2.5-flash? ---
+
+I ran this to check what models are available on the API key:
+  import google.generativeai as genai
+  genai.configure(api_key="...")
+  for m in genai.list_models():
+      if "generateContent" in m.supported_generation_methods:
+          print(m.name)
+
+gemini-2.5-flash was available and it's:
+  - Fast (flash = optimized for speed)
+  - Free tier available
+  - Good at instruction following (stays within context)
+
+
+----------------------------------------------------------------
+FILE 3: app.py
+----------------------------------------------------------------
+
+PURPOSE: Expose the RAG agent as a REST API using FastAPI.
+
+--- WHY FASTAPI? ---
+
+FastAPI is a Python web framework.
+  - Fast to write
+  - Automatic input validation via Pydantic
+  - Auto-generates Swagger UI at /docs
+  - Returns proper HTTP error codes
+
+--- ENDPOINTS ---
+
+GET /health
+  Just checks if server is running.
+  Useful in production to know if the service is alive.
+  Returns: {"status": "ok"}
+
+POST /query
+  Main endpoint. Takes a question, returns answer + chunks.
+  Request body: {"query": "your question here"}
+  Response: {query, retrieved_chunks, answer}
+
+GET /chunks
+  Returns all 12 indexed chunks.
+  Useful to verify what got indexed, debug retrieval issues.
+
+--- PYDANTIC MODELS ---
+
+class QueryRequest(BaseModel):
+    query: str
+
+FastAPI automatically:
+  - Reads the JSON body
+  - Validates it has a "query" field
+  - Returns 422 error if missing or wrong type
+  - No manual validation code needed
+
+--- ERROR HANDLING ---
+
+try:
+    result = run_query(request.query)
+except Exception as e:
+    raise HTTPException(status_code=500, detail=str(e))
+
+If anything fails inside the agent (FAISS error, Gemini API error, etc.)
+we catch it and return a proper 500 response with the error message.
+Without this, FastAPI would return a generic 500 with no useful info.
+
+
+----------------------------------------------------------------
+HOW TO DEBUG - COMMON ISSUES
+----------------------------------------------------------------
+
+ISSUE 1: "ModuleNotFoundError"
+  Cause: package not installed or wrong venv active
+  Fix:
+    uv pip install -r requirements.txt
+    make sure you're using .venv\Scripts\python.exe
+
+ISSUE 2: "faiss_index.bin not found"
+  Cause: ingest.py was never run
+  Fix:
+    .venv\Scripts\python.exe ingest.py
+
+ISSUE 3: Gemini 404 "model not found"
+  Cause: wrong model name
+  Fix: run this to list available models:
+    .venv\Scripts\python.exe -c "
+    import google.generativeai as genai
+    genai.configure(api_key='YOUR_KEY')
+    for m in genai.list_models():
+        if 'generateContent' in m.supported_generation_methods:
+            print(m.name)
+    "
+
+ISSUE 4: Gemini 429 "quota exceeded"
+  Cause: free tier rate limit hit
+  Fix: wait 1 minute (per-minute limit) or until next day (daily limit)
+  Or: create a new API key at https://aistudio.google.com/apikey
+
+ISSUE 5: Wrong answers / irrelevant chunks retrieved
+  Cause: query phrasing doesn't match chunk content well
+  Debug: call GET /chunks to see all chunks
+         check the scores in the response - if all below 0.3, retrieval is poor
+  Fix: rephrase the query to use words that appear in the dataset
+
+ISSUE 6: API key not loading
+  Cause: .env file not found or load_dotenv() not called
+  Debug: add this temporarily in agent.py:
+    print("API KEY:", os.getenv("GEMINI_API_KEY"))
+  Fix: make sure .env file is in the same folder as agent.py
+
+ISSUE 7: Server not reloading after code change
+  Cause: --reload flag watches for .py file changes
+  Fix: save the file. If still not reloading, restart the server manually.
+
+ISSUE 8: 422 Unprocessable Entity from FastAPI
+  Cause: request body is wrong format
+  Fix: make sure you're sending JSON with Content-Type: application/json
+  Postman: Body --> raw --> JSON --> {"query": "your question"}
+
+
+----------------------------------------------------------------
+HOW TO TEST IN POSTMAN
+----------------------------------------------------------------
+
+1. Open Postman
+2. Create new request
+
+TEST 1 - Health check:
+  Method: GET
+  URL: http://localhost:8000/health
+  Expected: {"status": "ok", "message": "API is running"}
+
+TEST 2 - Ask a question:
+  Method: POST
+  URL: http://localhost:8000/query
+  Headers: Content-Type: application/json
+  Body: raw > JSON:
+    {
+      "query": "What is the admission process at Velammal?"
+    }
+  Expected: JSON with query, retrieved_chunks (3 items), answer
+
+TEST 3 - See all chunks:
+  Method: GET
+  URL: http://localhost:8000/chunks
+  Expected: list of all 12 indexed paragraphs
+
+TEST 4 - Swagger UI (browser):
+  Open: http://localhost:8000/docs
+  You can test all endpoints directly from the browser here.
+
+TEST 5 - Empty query (should fail):
+  Method: POST
+  URL: http://localhost:8000/query
+  Body: {"query": ""}
+  Expected: 400 Bad Request - "query cannot be empty"
+
+
+----------------------------------------------------------------
+HOW TO RUN FROM SCRATCH (full steps)
+----------------------------------------------------------------
+
+1. Clone repo:
+   git clone https://github.com/KowsalyaSaravanan/karka_kasadara.git
+   cd karka_kasadara
+
+2. Create venv with Python 3.12:
+   uv venv --python 3.12
+
+3. Install dependencies:
+   uv pip install -r requirements.txt
+
+4. Create .env file:
+   GEMINI_API_KEY=your_key_here
+
+5. Build FAISS index:
+   .venv\Scripts\python.exe ingest.py
+
+6. Start server:
+   .venv\Scripts\python.exe -m uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+
+7. Test in Postman or browser at http://localhost:8000/docs
+
+
+----------------------------------------------------------------
+TECH STACK SUMMARY
+----------------------------------------------------------------
+
+sentence-transformers   --> convert text to vectors (embeddings)
+faiss-cpu               --> store and search vectors fast
+langgraph               --> structure the agent as a graph pipeline
+langchain-google-genai  --> connect to Gemini API via LangChain
+langchain-core          --> base classes (HumanMessage etc)
+google-generativeai     --> Gemini SDK (used to list available models)
+fastapi                 --> REST API framework
+uvicorn                 --> ASGI server to run FastAPI
+pydantic                --> request/response validation
+python-dotenv           --> load .env file for API key
+numpy                   --> array operations for embeddings
+uv                      --> fast Python package manager
+
+
+----------------------------------------------------------------
+KEY CONCEPTS TO REMEMBER FOR INTERVIEW
+----------------------------------------------------------------
+
+Q: Why FAISS and not a regular database?
+A: Regular databases search by exact match or text search.
+   FAISS searches by vector similarity - finds semantically similar content
+   even if the exact words don't match.
+   Example: query "school charges" will find chunk about "fee structure"
+   because they mean the same thing in vector space.
+
+Q: Why normalize vectors before storing in FAISS?
+A: Normalization makes all vectors unit length (magnitude = 1).
+   Then inner product = cosine similarity.
+   Cosine similarity measures angle between vectors = semantic similarity.
+   Without normalization, longer texts would have larger magnitude and
+   score higher just because of length, not relevance.
+
+Q: Why LangGraph instead of just calling functions?
+A: LangGraph gives a clean state machine. Each node has a clear job.
+   Easy to extend - can add a reranker node, a query rewriter node,
+   a memory node without changing existing code.
+   State is explicit - you always know what data is flowing where.
+
+Q: How do you prevent hallucination?
+A: Two ways:
+   1. Prompt engineering - explicitly tell the model "only use context below"
+   2. Low temperature (0.2) - keeps model close to the provided context
+   The model can still hallucinate but the strict prompt reduces it significantly.
+
+Q: What is the chunking strategy and why?
+A: Paragraph-level splitting by double newline.
+   Each paragraph in this dataset covers one topic.
+   Keeps related sentences together.
+   Tried character-level splitting first - sentences got cut mid-way,
+   retrieval quality was worse.
+
+Q: How does the retrieval score work?
+A: Score is cosine similarity between query vector and chunk vector.
+   Range 0 to 1. Higher = more similar.
+   Score above 0.6 = very relevant.
+   Score below 0.3 = probably not relevant to the query.
+
+================================================================
+END OF NOTES
+================================================================

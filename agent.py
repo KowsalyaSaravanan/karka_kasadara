@@ -1,15 +1,3 @@
-"""
-agent.py
---------
-LangGraph-based RAG agent.
-
-Graph nodes:
-  1. retrieve  - embed query, search FAISS, return top-3 chunks
-  2. generate  - build prompt from chunks, call Gemini Flash, return answer
-
-State flows: START -> retrieve -> generate -> END
-"""
-
 import os
 import json
 from typing import TypedDict
@@ -24,85 +12,95 @@ from langgraph.graph import StateGraph, START, END
 
 load_dotenv()
 
-# ── constants ────────────────────────────────────────────────────────────────
-INDEX_PATH  = "faiss_index.bin"
-CHUNKS_PATH = "chunks.json"
-EMBED_MODEL = "all-MiniLM-L6-v2"
-TOP_K       = 3
+INDEX_FILE = "faiss_index.bin"
+CHUNKS_FILE = "chunks.json"
+TOP_K = 3
 
-# ── shared resources (loaded once at import) ─────────────────────────────────
-_embed_model = SentenceTransformer(EMBED_MODEL)
-_index       = faiss.read_index(INDEX_PATH)
-with open(CHUNKS_PATH, "r", encoding="utf-8") as _f:
-    _chunks: list[str] = json.load(_f)
+# load everything once when module is imported
+# dont want to reload model on every request - too slow
+embed_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-_llm = ChatGoogleGenerativeAI(
+faiss_index = faiss.read_index(INDEX_FILE)
+
+with open(CHUNKS_FILE, "r", encoding="utf-8") as f:
+    all_chunks = json.load(f)
+
+# using gemini-2.5-flash - checked available models via list_models()
+# temperature low so answers stay grounded
+llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
     google_api_key=os.getenv("GEMINI_API_KEY"),
-    temperature=0.2,
+    temperature=0.2
 )
 
 
-# ── graph state ──────────────────────────────────────────────────────────────
-class RAGState(TypedDict):
-    query:            str
-    retrieved_chunks: list[dict]   # [{rank, score, chunk}]
-    answer:           str
+# langgraph needs a typed state dict to pass between nodes
+class AgentState(TypedDict):
+    query: str
+    chunks: list[dict]
+    answer: str
 
 
-# ── node 1: retrieve ─────────────────────────────────────────────────────────
-def retrieve(state: RAGState) -> RAGState:
-    """Embed the query and fetch top-K chunks from FAISS."""
-    q_emb = _embed_model.encode([state["query"]], convert_to_numpy=True).astype(np.float32)
-    faiss.normalize_L2(q_emb)
-    scores, indices = _index.search(q_emb, TOP_K)
+def retrieve_node(state: AgentState):
+    query = state["query"]
 
-    chunks = [
-        {"rank": int(i + 1), "score": round(float(scores[0][i]), 4), "chunk": _chunks[int(indices[0][i])]}
-        for i in range(TOP_K)
-    ]
-    return {**state, "retrieved_chunks": chunks}
+    # embed the query the same way we embedded the chunks
+    q_vec = embed_model.encode([query], convert_to_numpy=True).astype(np.float32)
+    faiss.normalize_L2(q_vec)
+
+    scores, indices = faiss_index.search(q_vec, TOP_K)
+
+    results = []
+    for i in range(TOP_K):
+        results.append({
+            "rank": i + 1,
+            "score": round(float(scores[0][i]), 4),
+            "chunk": all_chunks[int(indices[0][i])]
+        })
+
+    return {**state, "chunks": results}
 
 
-# ── node 2: generate ─────────────────────────────────────────────────────────
-def generate(state: RAGState) -> RAGState:
-    """Build a grounded prompt and call Gemini Flash."""
-    context = "\n\n".join(c["chunk"] for c in state["retrieved_chunks"])
-    prompt = (
-        "You are a helpful assistant for Velammal School.\n"
-        "Answer the question using ONLY the context provided below.\n"
-        "Do NOT use any outside knowledge.\n"
-        "If the answer is not in the context, say: "
-        "'I don't have enough information to answer that.'\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {state['query']}\n\n"
-        "Answer:"
-    )
-    response = _llm.invoke([HumanMessage(content=prompt)])
+def generate_node(state: AgentState):
+    # join top chunks as context
+    context = "\n\n".join(item["chunk"] for item in state["chunks"])
+
+    # strict prompt - only answer from context, no outside knowledge
+    prompt = f"""You are a helpful assistant for Velammal School.
+Answer the question using ONLY the context below.
+Do not use any outside knowledge.
+If the answer is not in the context, say "I don't have enough information to answer that."
+
+Context:
+{context}
+
+Question: {state['query']}
+
+Answer:"""
+
+    response = llm.invoke([HumanMessage(content=prompt)])
     return {**state, "answer": response.content.strip()}
 
 
-# ── build graph ──────────────────────────────────────────────────────────────
-def build_graph():
-    builder = StateGraph(RAGState)
-    builder.add_node("retrieve", retrieve)
-    builder.add_node("generate", generate)
-    builder.add_edge(START, "retrieve")
-    builder.add_edge("retrieve", "generate")
-    builder.add_edge("generate", END)
-    return builder.compile()
+def build_rag_graph():
+    graph = StateGraph(AgentState)
+    graph.add_node("retrieve", retrieve_node)
+    graph.add_node("generate", generate_node)
+    graph.add_edge(START, "retrieve")
+    graph.add_edge("retrieve", "generate")
+    graph.add_edge("generate", END)
+    return graph.compile()
 
 
-# single compiled graph instance
-rag_graph = build_graph()
+# compile once at startup
+rag_graph = build_rag_graph()
 
 
-def run_query(query: str) -> dict:
-    """Run the full RAG graph for a given query."""
-    initial_state: RAGState = {
-        "query": query,
-        "retrieved_chunks": [],
-        "answer": "",
+def run_query(user_query: str):
+    state = {
+        "query": user_query,
+        "chunks": [],
+        "answer": ""
     }
-    result = rag_graph.invoke(initial_state)
+    result = rag_graph.invoke(state)
     return result

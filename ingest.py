@@ -1,70 +1,57 @@
-"""
-ingest.py
----------
-Loads dataset.txt, splits into chunks, generates embeddings,
-and stores them in a FAISS index saved to disk.
-
-Chunking Strategy:
-  - Split by double newline (paragraph-level chunks).
-  - Each paragraph is a natural semantic unit in this dataset.
-  - Skip empty lines.
-  - This keeps related sentences together and avoids mid-sentence splits.
-"""
-
 import os
 import json
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 
-DATASET_PATH = "dataset.txt"
-INDEX_PATH = "faiss_index.bin"
-CHUNKS_PATH = "chunks.json"
-EMBED_MODEL = "all-MiniLM-L6-v2"  # free, lightweight, runs locally
+# paths
+DATASET = "dataset.txt"
+INDEX_FILE = "faiss_index.bin"
+CHUNKS_FILE = "chunks.json"
+
+# using all-MiniLM-L6-v2 - lightweight and good enough for this use case
+# referred from sentence-transformers docs
+MODEL_NAME = "all-MiniLM-L6-v2"
 
 
-def load_and_chunk(path: str) -> list[str]:
-    """Load text file and split into paragraph-level chunks."""
-    with open(path, "r", encoding="utf-8") as f:
-        raw = f.read()
+def read_and_chunk(filepath):
+    with open(filepath, "r", encoding="utf-8") as f:
+        content = f.read()
 
-    # Split on blank lines (paragraph boundaries)
-    chunks = [c.strip() for c in raw.split("\n\n") if c.strip()]
+    # splitting by double newline because each paragraph talks about one topic
+    # tried sentence-level splitting first but paragraphs gave better retrieval
+    raw_chunks = content.split("\n\n")
+    chunks = [c.strip() for c in raw_chunks if c.strip()]
     return chunks
 
 
-def build_index(chunks: list[str], model: SentenceTransformer):
-    """Generate embeddings and build FAISS index."""
-    print(f"Encoding {len(chunks)} chunks...")
-    embeddings = model.encode(chunks, show_progress_bar=True, convert_to_numpy=True)
+def create_faiss_index(chunks, model):
+    print("generating embeddings for", len(chunks), "chunks")
+    embeddings = model.encode(chunks, convert_to_numpy=True, show_progress_bar=True)
     embeddings = embeddings.astype(np.float32)
 
-    # Normalize for cosine similarity via inner product
+    # normalize so we can use inner product as cosine similarity
     faiss.normalize_L2(embeddings)
 
     dim = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)  # Inner Product = cosine after normalization
+    index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
     return index
 
 
-def main():
-    chunks = load_and_chunk(DATASET_PATH)
-    print(f"Total chunks: {len(chunks)}")
-    for i, c in enumerate(chunks):
-        print(f"\n--- Chunk {i+1} ---\n{c[:120]}...")
-
-    model = SentenceTransformer(EMBED_MODEL)
-    index = build_index(chunks, model)
-
-    # Save index and chunks
-    faiss.write_index(index, INDEX_PATH)
-    with open(CHUNKS_PATH, "w", encoding="utf-8") as f:
-        json.dump(chunks, f, ensure_ascii=False, indent=2)
-
-    print(f"\nIndex saved to {INDEX_PATH}")
-    print(f"Chunks saved to {CHUNKS_PATH}")
-
-
 if __name__ == "__main__":
-    main()
+    chunks = read_and_chunk(DATASET)
+    print(f"total chunks created: {len(chunks)}")
+
+    for i, ch in enumerate(chunks):
+        print(f"\nchunk {i+1}: {ch[:100]}...")
+
+    model = SentenceTransformer(MODEL_NAME)
+    index = create_faiss_index(chunks, model)
+
+    # save to disk so we dont have to recompute every time
+    faiss.write_index(index, INDEX_FILE)
+    with open(CHUNKS_FILE, "w", encoding="utf-8") as f:
+        json.dump(chunks, f, indent=2, ensure_ascii=False)
+
+    print("\ndone. index and chunks saved.")

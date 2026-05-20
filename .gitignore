@@ -12,6 +12,11 @@ __pycache__/
 # uv lock (optional to commit, keeping it out for simplicity)
 # uv.lock
 
+# Personal notes
+DEEP_DIVE_NOTES.txt
+
 # OS
 .DS_Store
 Thumbs.db
+
+DEEP_DIVE_NOTES.txt
